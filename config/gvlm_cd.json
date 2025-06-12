@@ -1,0 +1,139 @@
+{
+    "name": "ddpm-RS-CDHead-GVLM-CD", // 项目名称，可以自定义
+    "phase": "train", // "train" 或 "test"
+    "gpu_ids": [
+        0, // 使用的GPU ID - 已修改，您可以根据实际情况调整为例如 [0,1,2,3]
+        1,
+        2,
+        3
+    ],
+
+    "path": { // DDPM模型相关路径
+        "log": "logs/gvlm_cd_ddpm", // 日志保存路径
+        "tb_logger": "tb_logger/gvlm_cd_ddpm", // TensorBoard日志路径
+        "results": "results/gvlm_cd_ddpm", // 结果保存路径
+        "checkpoint": "checkpoint/gvlm_cd_ddpm", // DDPM checkpoint保存路径
+        // "resume_state": null // 如果从头训练DDPM
+        "resume_state": "/hdd1/bliao6/bowen/DDPM-CD/ddpm-cd/pre-trained/I190000_E97/I190000_E97" // 设置为您的预训练DDPM checkpoint路径，例如 E97_gen.pth 所在的文件夹或具体文件
+    },
+
+    "path_cd": { // 变化检测头相关路径
+        "log": "logs/gvlm_cd_cdhead",
+        "tb_logger": "tb_logger/gvlm_cd_cdhead",
+        "results": "results/gvlm_cd_cdhead",
+        "checkpoint": "checkpoint/gvlm_cd_cdhead",
+        "resume_state": null // 如果从头训练CD头，或者设置为已有的CD头checkpoint路径
+    },
+
+    "datasets": {
+        "train": {
+            "name": "GVLM-CD-Landslide-256", // 数据集名称
+            "dataroot": "/hdd1/bliao6/bowen/DDPM-CD/datasets/GVLM_CD_cropped_with_metadata/", // !!! 重要：请修改为您的数据集根目录 !!!
+            "resolution": 256, // 图像块分辨率
+            "batch_size": 1,    // 根据您的GPU显存调整 - 已从8修改为1
+            "num_workers": 8,   // 根据您的CPU核心数调整
+            "use_shuffle": true,
+            "data_len": -1 // -1 表示使用所有数据
+        },
+        "val": {
+            "name": "GVLM-CD-Landslide-256",
+            "dataroot": "/hdd1/bliao6/bowen/DDPM-CD/datasets/GVLM_CD_cropped_with_metadata/", // !!! 重要：请修改为您的数据集根目录 !!!
+            "resolution": 256,
+            "batch_size": 1,    // 根据您的GPU显存调整 - 已从4修改为1
+            "num_workers": 8,
+            "use_shuffle": false, // 验证集通常不打乱
+            "data_len": -1
+        },
+        "test": {
+            "name": "GVLM-CD-Landslide-256",
+            "dataroot": "/hdd1/bliao6/bowen/DDPM-CD/datasets/GVLM_CD_cropped_with_metadata/", // !!! 重要：请修改为您的数据集根目录 !!!
+            "resolution": 256,
+            "batch_size": 1,    // 根据您的GPU显存调整 - 已从4修改为1
+            "num_workers": 8,
+            "use_shuffle": false,
+            "data_len": -1
+        }
+    },
+
+    "model_cd": { // 变化检测头参数
+        "feat_scales": [2, 5, 8, 11, 14], // 从DDPM解码器提取特征的层级索引 (0-based, 需要与U-Net结构对应)
+        "out_channels": 2, // 输出通道数。对于二值滑坡检测 (滑坡/非滑坡)，通常是1 (配合sigmoid和BCELoss) 或 2 (配合softmax和CrossEntropyLoss)
+                           // 如果标签是0/1的单通道，这里设为1，损失函数用BCELoss或DiceLoss。
+                           // 如果用CrossEntropyLoss，这里设为2，标签需要是LongTensor且值为0或1。
+        "loss_type": "ce", // 损失类型，"ce" (交叉熵) 或 "dice" 等。根据out_channels和标签格式选择。
+                           // 如果 out_channels=1 且标签是0/1浮点数，常用 "bce" (BinaryCrossEntropy)
+        "output_cm_size": 256, // 输出变化图的尺寸，应与输入图像块分辨率一致
+        "psp": true, // 是否使用PSP模块
+        "feat_type": "dec", // 从DDPM的 'enc' (编码器) 或 'dec' (解码器) 提取特征
+        "t": [50, 100, 400] // 用于从DDPM提取特征的时间步 t 的值
+    },
+
+    "model": { // DDPM模型参数 (通常与预训练DDPM的配置一致)
+        "which_model_G": "sr3", // DDPM网络结构类型
+        "finetune_norm": false,
+        "unet": {
+            "in_channel": 3, // 输入图像通道数 (RGB为3)
+            "out_channel": 3, // DDPM输出图像通道数 (通常与输入一致)
+            "inner_channel": 128, // U-Net内部基础通道数
+            "channel_multiplier": [
+                1,
+                2,
+                4,
+                8,
+                8
+            ],
+            "attn_res": [
+                16 // 在哪些分辨率下使用注意力机制
+            ],
+            "res_blocks": 2, // 每个分辨率层级的残差块数量
+            "dropout": 0.2
+        },
+        "beta_schedule": { // 噪声调度表
+            "train": {
+                "schedule": "linear",
+                "n_timestep": 2000,
+                "linear_start": 1e-6,
+                "linear_end": 1e-2
+            },
+            "val": { // 验证和测试时通常使用与训练相同的或简化的调度
+                "schedule": "linear",
+                "n_timestep": 2000,
+                "linear_start": 1e-6,
+                "linear_end": 1e-2
+            },
+            "test": {
+                "schedule": "linear",
+                "n_timestep": 2000, // 测试时采样步数可能会减少以加速，但这指的是DDPM本身的采样，特征提取时用的是固定的t值
+                "linear_start": 1e-6,
+                "linear_end": 1e-2
+            }
+        },
+        "diffusion": {
+            "image_size": 256, // DDPM处理的图像尺寸
+            "channels": 3,
+            "loss": "l2", // DDPM预训练时的损失 "l1" 或 "l2"
+            "conditional": false // DDPM是否为条件生成模型
+        }
+    },
+    
+    "train": { // 训练参数
+        "n_epoch": 100, // 总训练周期数，根据您的数据集大小和收敛情况调整
+        "train_print_freq": 500, // 训练时打印日志的频率 (iteration)
+        "val_freq": 1, // 每多少个epoch进行一次验证
+        "val_print_freq": 50, // 验证时打印日志的频率 (iteration)
+        "optimizer": {
+            "type": "adamw", // 优化器类型，DDPM-CD常用AdamW
+            "lr": 1e-4 // 学习率
+            // "weight_decay": 1e-2 // 可以添加权重衰减
+        },
+        "scheduler": { // 学习率调度器
+            "lr_policy": "linear",  // "linear", "poly", "step", "cosine"
+            "n_steps": 3,           // 仅用于 "step" 调度器
+            "gamma": 0.1,           // 用于 "step" 调度器
+            "eta_min": 1e-7         // 用于 "cosine" 调度器
+        }
+    },
+    "wandb": { // Weights & Biases 日志配置 (如果使用)
+        "project": "ddpm-RS-CDHead-GVLM-CD" // WandB项目名称
+    }
+}

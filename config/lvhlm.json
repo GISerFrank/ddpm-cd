@@ -1,0 +1,190 @@
+{
+    "name": "ddpm-RS-CDHead-LVHLM",  // 修改为你的项目名
+    "phase": "train", // train or test
+    "gpu_ids": [
+        0
+    ],
+
+    "path": { //设置路径
+        "log": "logs",
+        "tb_logger": "tb_logger", 
+        "results": "results",
+        "checkpoint": "checkpoint",
+        // 如果有预训练模型，取消注释并设置路径
+        //"resume_state": "path/to/your/pretrained/model"
+        "resume_state": null
+    },
+
+    "path_cd": { //变化检测头路径
+        "log": "logs",
+        "tb_logger": "tb_logger",
+        "results": "results", 
+        "checkpoint": "checkpoint",
+        "resume_state": null
+        // 如果要加载预训练的变化检测头，设置路径
+        //"resume_state": "path/to/your/cd_head_model"
+    },
+
+    "datasets": {
+        "train": {
+            "name": "YourDataset-256",              // 修改为你的数据集名称
+            "dataroot": "dataset/YourDataset/",     // 修改为你的数据集路径
+            "resolution": 256,                      // 修改为你的图像分辨率
+            "batch_size": 8,                        // 根据GPU内存调整
+            "num_workers": 8,                       // 根据CPU核心数调整
+            "use_shuffle": true,
+            "data_len": -1,                         // -1表示使用全部数据
+            // 自定义数据集参数
+            "augmentation": true,                   // 是否使用数据增强
+            "normalize": true,                      // 是否标准化
+            "crop_size": 256,                       // 裁剪尺寸
+            "flip_prob": 0.5                        // 翻转概率
+        },
+        "val": {
+            "name": "YourDataset-256",
+            "dataroot": "dataset/YourDataset/",
+            "resolution": 256,
+            "batch_size": 4,                        // 验证时可以用更小的batch
+            "num_workers": 4,
+            "use_shuffle": false,                   // 验证时不需要打乱
+            "data_len": -1,
+            "augmentation": false,                  // 验证时不使用数据增强
+            "normalize": true,
+            "crop_size": 256
+        },
+        "test": {
+            "name": "YourDataset-256", 
+            "dataroot": "dataset/YourDataset/",
+            "resolution": 256,
+            "batch_size": 1,                        // 测试时通常用batch_size=1
+            "num_workers": 1,
+            "use_shuffle": false,
+            "data_len": -1,
+            "augmentation": false,
+            "normalize": true,
+            "crop_size": 256
+        }
+    },
+
+    "model_cd": {
+        "feat_scales": [2, 5, 8, 11, 14],          // 特征提取层，可能需要根据你的数据调整
+        "out_channels": 2,                          // 输出类别数：如果是二分类变化检测保持2
+        "loss_type": "ce",                          // 损失类型：ce(交叉熵), focal, dice等
+        "output_cm_size": 256,                      // 输出变化图尺寸
+        "psp": true,                                // 是否使用金字塔池化
+        "feat_type": "dec",                         // 特征类型：'enc'(编码器) 或 'dec'(解码器)
+        "t": [50, 100, 400],                       // 扩散时间步，可能需要调整
+        // 针对你的数据集的特殊配置
+        "class_weights": [1.0, 1.0],               // 类别权重，处理类别不平衡
+        "ignore_index": -1,                        // 忽略的标签值
+        "use_auxiliary_loss": false                 // 是否使用辅助损失
+    },
+
+    "model": {
+        "which_model_G": "sr3",                     // 网络结构
+        "finetune_norm": false,
+        "unet": {
+            "in_channel": 3,                        // 输入通道数：RGB=3, 如果是多光谱需要修改
+            "out_channel": 3,                       // 输出通道数
+            "inner_channel": 128,                   // 内部通道数，可根据GPU内存调整
+            "channel_multiplier": [                 // 各层通道倍数，可以调整网络深度
+                1,
+                2, 
+                4,
+                8,
+                8
+            ],
+            "attn_res": [                           // 注意力机制的分辨率
+                16
+            ],
+            "res_blocks": 2,                        // 残差块数量
+            "dropout": 0.2                          // Dropout率，防止过拟合
+        },
+        "beta_schedule": { // Beta调度，影响扩散过程
+            "train": {
+                "schedule": "linear",               // 调度类型：linear, cosine
+                "n_timestep": 2000,                 // 时间步数，可以减少以加快训练
+                "linear_start": 1e-6,               // 起始beta值
+                "linear_end": 1e-2                  // 结束beta值
+            },
+            "val": {
+                "schedule": "linear",
+                "n_timestep": 2000,
+                "linear_start": 1e-6,
+                "linear_end": 1e-2
+            },
+            "test": {
+                "schedule": "linear", 
+                "n_timestep": 2000,                 // 测试时可以使用更少步数加快推理
+                "linear_start": 1e-6,
+                "linear_end": 1e-2
+            }
+        },
+        "diffusion": {
+            "image_size": 256,                      // 图像尺寸
+            "channels": 3,                          // 通道数
+            "loss": "l2",                           // 扩散损失：l1 或 l2
+            "conditional": false                    // 是否条件生成
+        }
+    },
+    
+    "train": {
+        "n_epoch": 80,                              // 训练轮数，根据数据集大小调整
+        "train_print_freq": 500,                    // 训练信息打印频率
+        "val_freq": 1,                              // 验证频率（每几个epoch验证一次）
+        "val_print_freq": 50,                       // 验证信息打印频率
+        "save_checkpoint_freq": 5,                  // 保存检查点频率
+        "optimizer": {
+            "type": "adam",                         // 优化器类型：adam, adamw, sgd
+            "lr": 1e-4,                             // 学习率，可能需要根据数据集调整
+            "weight_decay": 1e-4,                   // 权重衰减
+            "beta1": 0.9,                           // Adam参数
+            "beta2": 0.999                          // Adam参数
+        },
+        "scheduler": {
+            "lr_policy": "linear",                  // 学习率策略：linear, poly, step, cosine
+            "n_steps": 3,                           // step调度器的步数
+            "gamma": 0.1,                           // 衰减因子
+            "warmup_epochs": 5                      // 预热轮数（可选）
+        },
+        // 早停配置（可选）
+        "early_stopping": {
+            "patience": 10,                         // 耐心值
+            "min_delta": 1e-6,                      // 最小改善值
+            "monitor": "val_loss"                   // 监控指标
+        }
+    },
+
+    // Weights & Biases配置
+    "wandb": {
+        "project": "ddpm-RS-CDHead-LVHLM",    // 修改为你的项目名
+        "entity": "giserfrank",                  // 你的wandb用户名或团队名
+        "group": "preliminary",                        // 实验组名
+        "tags": ["ddpm", "change-detection", "LVHLM"], // 标签
+        "notes": "Training on custom bitemporal landslide dataset with DDPM-based change detection"
+    },
+
+    // 数据预处理配置
+    "preprocessing": {
+        "mean": [0.485, 0.456, 0.406],             // ImageNet均值，可能需要根据你的数据调整
+        "std": [0.229, 0.224, 0.225],              // ImageNet标准差
+        "resize_method": "bilinear",                // 调整大小方法
+        "padding_mode": "reflect"                   // 填充模式
+    },
+
+    // 评估指标配置
+    "metrics": {
+        "primary": "iou",                           // 主要评估指标：iou, f1, accuracy
+        "compute_per_class": true,                  // 是否计算每类指标
+        "save_prediction_images": true,             // 是否保存预测图像
+        "save_freq": 10                             // 保存预测图像的频率
+    },
+
+    // 硬件和性能配置
+    "hardware": {
+        "mixed_precision": true,                    // 是否使用混合精度训练
+        "pin_memory": true,                         // 是否pin memory
+        "persistent_workers": true,                 // 是否使用持久化workers
+        "compile_model": false                      // 是否编译模型（PyTorch 2.0+）
+    }
+}
