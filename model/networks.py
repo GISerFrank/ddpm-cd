@@ -192,100 +192,136 @@ def define_CD(opt):
     cd_model_opt = opt['model_cd']
     diffusion_model_opt = opt['model']
     
-    # 1. 实例化 netCD (此时它可能在CPU上)
-    netCD = cd_head_v2(feat_scales=cd_model_opt['feat_scales'], 
-                    out_channels=cd_model_opt['out_channels'], 
-                    inner_channel=diffusion_model_opt['unet']['inner_channel'], 
-                    channel_multiplier=diffusion_model_opt['unet']['channel_multiplier'],
-                    img_size=cd_model_opt['output_cm_size'],
-                    time_steps=cd_model_opt["t"])
+    # 检查版本
+    version = cd_model_opt.get('version', 'v2')
+    logger.info(f"Creating CD model version: {version}")
     
-    # 2. 如果是训练阶段，初始化权重 (通常在CPU上操作)
+    # 1. 根据版本实例化相应的 CD 模型
+    if version == 'v8':
+        from model.cd_modules.cd_head_v8 import cd_head_v8
+        
+        # 准备物理配置
+        physics_config = cd_model_opt.get('physics_attention', {})
+        
+        netCD = cd_head_v8(
+            feat_scales=cd_model_opt['feat_scales'],
+            out_channels=cd_model_opt['out_channels'],
+            inner_channel=diffusion_model_opt['unet']['inner_channel'],
+            channel_multiplier=diffusion_model_opt['unet']['channel_multiplier'],
+            img_size=cd_model_opt['output_cm_size'],
+            time_steps=cd_model_opt["t"],
+            physics_config=physics_config
+        )
+        logger.info(f"CD v8 initialized with physics support: {physics_config.get('enabled', False)}")
+        
+    else:
+        # 默认使用 v2
+        netCD = cd_head_v2(
+            feat_scales=cd_model_opt['feat_scales'], 
+            out_channels=cd_model_opt['out_channels'], 
+            inner_channel=diffusion_model_opt['unet']['inner_channel'], 
+            channel_multiplier=diffusion_model_opt['unet']['channel_multiplier'],
+            img_size=cd_model_opt['output_cm_size'],
+            time_steps=cd_model_opt["t"]
+        )
+    
+    # 2. 如果是训练阶段，初始化权重
     if opt['phase'] == 'train':
         init_weights(netCD, init_type='orthogonal')
 
-    # --- 开始为 profiling 准备设备和模型 ---
-    # 3. 确定用于 profiling 的设备 (通常是第一个GPU或CPU)
-    if opt.get('gpu_ids') and torch.cuda.is_available(): # 确保 gpu_ids 存在且CUDA可用
+    # 3. Profiling 准备
+    if opt.get('gpu_ids') and torch.cuda.is_available():
         profile_device = torch.device(f"cuda:{opt['gpu_ids'][0]}")
     else:
         profile_device = torch.device('cpu')
     logger.info(f"Profiling on device: {profile_device}")
 
-    # 4. 创建 netCD 的一个深拷贝，并将其显式移动到 profile_device
-    # 这是将要被 thop.profile 分析的模型实例
+    # 4. 创建用于 profiling 的模型副本
     model_to_profile = copy.deepcopy(netCD)
     model_to_profile.to(profile_device)
-    # --- 结束为 profiling 准备模型 ---
 
-    # 注意：原始的 netCD 实例的设备将由调用 define_CD 之后的 set_device 方法处理。
-    #这里的 model_to_profile 仅用于当前的 profiling。
-
-    # 5. 创建用于 profiling 的虚拟输入 F_A, F_B，并确保它们在 profile_device 上
-    # (原始代码中 .cuda() 会将它们放到默认GPU，现在改为 .to(profile_device))
+    # 5. 创建用于 profiling 的虚拟输入
     F_A_prof, F_B_prof = [], [] 
     feat_scales = cd_model_opt['feat_scales'].copy()
-    feat_scales.sort(reverse=True) # 深层特征在前
-    h_curr, w_curr = 8, 8 # 假设最深层特征图的起始尺寸
+    feat_scales.sort(reverse=True)
+    h_curr, w_curr = 8, 8
 
-    # 这个循环是为了构建一个符合 cd_head_v2.forward 输入结构的虚拟特征列表
-    # feats_A 和 feats_B 应该是列表的列表: List[List[Tensor]]
-    # 外层列表对应时间步 t (来自 opt['model_cd']['t'])
-    # 内层列表对应不同的特征尺度 (来自 opt['model_cd']['feat_scales'])
-    
-    # 为一个时间步构建多尺度特征
+    # 构建多尺度特征
     single_t_feats_A = []
     single_t_feats_B = []
     h_iter, w_iter = h_curr, w_curr
+    
     for i in range(0, len(feat_scales)):
-        # 计算该尺度特征的通道数
-        dim = get_in_channels([feat_scales[i]], diffusion_model_opt['unet']['inner_channel'], diffusion_model_opt['unet']['channel_multiplier'])
-        # 创建虚拟张量并移动到profile_device
+        dim = get_in_channels([feat_scales[i]], diffusion_model_opt['unet']['inner_channel'], 
+                            diffusion_model_opt['unet']['channel_multiplier'])
         A_s = torch.randn(1, dim, h_iter, w_iter).to(profile_device)
         B_s = torch.randn(1, dim, h_iter, w_iter).to(profile_device)
         single_t_feats_A.append(A_s)
         single_t_feats_B.append(B_s)
-        # 为下一个（更浅层）尺度更新h, w
-        if i < len(feat_scales) - 1: # 避免在最后一个尺度后也乘以2
+        
+        if i < len(feat_scales) - 1:
             h_iter *= 2
             w_iter *= 2
-            
-    # 为所有时间步复制这份多尺度特征列表
-    # （原始代码中F_A.append(f_A_r)暗示了每个时间步的虚拟特征可以相同）
+    
+    # 为所有时间步复制特征
     for _ in range(0, len(cd_model_opt["t"])):
-        F_A_prof.append(single_t_feats_A) # 使用深拷贝以防万一
+        F_A_prof.append(single_t_feats_A)
         F_B_prof.append(single_t_feats_B)
 
-    # 6. 使用已在正确设备上的 model_to_profile 和 F_A_prof, F_B_prof 进行分析
-    try:
-        flops, params = profile(model_to_profile, inputs=(F_A_prof, F_B_prof,), verbose=False)
-        flops, params = clever_format([flops, params])
-    except Exception as e_profile:
-        logger.warning(f"Thop profiling failed: {e_profile}. Check model and dummy input device/shapes. Setting flops/params to 0.")
-        flops, params = 0, 0
+    # 6. 为 v8 版本添加物理数据输入
+    if version == 'v8' and physics_config.get('enabled', False):
+        # 创建虚拟物理数据
+        num_physical_layers = physics_config.get('num_physical_layers', 2)
+        physical_data = torch.randn(1, num_physical_layers, 256, 256).to(profile_device)
+        
+        # v8 版本的 profiling
+        try:
+            flops, params = profile(model_to_profile, inputs=(F_A_prof, F_B_prof, physical_data), verbose=False)
+            flops, params = clever_format([flops, params])
+        except Exception as e_profile:
+            logger.warning(f"Thop profiling failed for v8: {e_profile}. Trying without physical data.")
+            try:
+                flops, params = profile(model_to_profile, inputs=(F_A_prof, F_B_prof, None), verbose=False)
+                flops, params = clever_format([flops, params])
+            except Exception as e2:
+                logger.warning(f"Thop profiling failed completely: {e2}")
+                flops, params = 0, 0
+        
+        # 推理时间测试
+        netGcopy_for_timing = model_to_profile
+        netGcopy_for_timing.eval()
+        with torch.no_grad():
+            start = time.time()
+            _ = netGcopy_for_timing(F_A_prof, F_B_prof, physical_data)
+            end = time.time()
+    else:
+        # v2 版本的 profiling
+        try:
+            flops, params = profile(model_to_profile, inputs=(F_A_prof, F_B_prof,), verbose=False)
+            flops, params = clever_format([flops, params])
+        except Exception as e_profile:
+            logger.warning(f"Thop profiling failed: {e_profile}.")
+            flops, params = 0, 0
+        
+        # 推理时间测试
+        netGcopy_for_timing = model_to_profile
+        netGcopy_for_timing.eval()
+        with torch.no_grad():
+            start = time.time()
+            _ = netGcopy_for_timing(F_A_prof, F_B_prof)
+            end = time.time()
     
-    # 7. 第二次分析（推理时间），同样确保模型在正确设备上
-    # 可以重用 model_to_profile，因为它只是被profile过，权重没变
-    netGcopy_for_timing = model_to_profile # 假设profile不改变模型状态
-    netGcopy_for_timing.eval()
-    with torch.no_grad():
-        start = time.time()
-        _ = netGcopy_for_timing(F_A_prof, F_B_prof) # 使用相同的虚拟输入
-        end = time.time()
     print('### Model Params: {} FLOPs: {} Time: {}ms ####'.format(params, flops, 1000*(end-start)))
     
-    del model_to_profile, netGcopy_for_timing, F_A_prof, F_B_prof, single_t_feats_A, single_t_feats_B 
-    ### --- ###
+    # 清理
+    del model_to_profile, netGcopy_for_timing, F_A_prof, F_B_prof, single_t_feats_A, single_t_feats_B
+    if version == 'v8' and physics_config.get('enabled', False):
+        del physical_data
 
-    # 8. （可选，但原始代码中有）如果需要分布式训练，在这里处理原始的 netCD
-    # 注意：如果进行了这个DataParallel包装，那么返回的netCD将是DataParallel对象
-    # set_device 方法也需要能正确处理这种情况
-    if opt.get('gpu_ids') and opt.get('distributed'): # 检查gpu_ids和distributed标志
+    # 7. 分布式训练处理
+    if opt.get('gpu_ids') and opt.get('distributed'):
         assert torch.cuda.is_available()
         logger.info("Wrapping netCD with DataParallel for distributed training.")
         netCD = nn.DataParallel(netCD, opt['gpu_ids'])
-        # 注意：DataParallel 会自动将模型数据复制到指定的多个GPU上
-        # 但主模型仍在 opt['gpu_ids'][0] 上。
-        # 如果不进行分布式训练，netCD 仍保持原样（可能在CPU或被后续set_device移动）
 
     return netCD

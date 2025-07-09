@@ -9,7 +9,18 @@ def create_model(opt):
     return m
 
 def create_CD_model(opt):
-    from .cd_model import CD as M
+    try:
+        # 尝试导入新的类名
+        from .cd_model import DDPMCDModel as M
+        logger.info('Using new DDPMCDModel with physics loss support')
+    except ImportError:
+        try:
+            # 回退到旧的类名
+            from .cd_model import CD as M
+            logger.info('Using legacy CD model')
+        except ImportError:
+            raise ImportError("Cannot import CD model. Check cd_model.py")
+    
     m = M(opt)
-    logger.info('Cd Model [{:s}] is created.'.format(m.__class__.__name__))
+    logger.info('CD Model [{:s}] is created.'.format(m.__class__.__name__))
     return m
