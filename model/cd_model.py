@@ -1,264 +1,343 @@
+import logging
+from collections import OrderedDict
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from model.cd_modules.psp import _PSPModule
-from model.cd_modules.se import ChannelSpatialSELayer
-from model.cd_modules.physics_attention import PhysicsGuidedAttention, MultiScalePhysicsAttention
-from model.cd_modules.physical_encoder import PhysicalFeatureEncoder
-from model.cd_modules.cross_attention import TemporalCrossAttention, MultiScaleCrossAttention
-from model.cd_modules.mamba_mixer import ChangeDetectionMamba
+import os
+import model.networks as networks
+from .base_model import BaseModel
+from misc.metric_tools import ConfuseMatrixMeter
+from misc.torchutils import get_scheduler
+
+logger = logging.getLogger('base')
 
 
-def get_in_channels(feat_scales, inner_channel, channel_multiplier):
-    '''Get the number of input channels for each scale'''
-    in_channels = 0
-    for scale in feat_scales:
-        if scale < 3:  # 256 x 256
-            in_channels += inner_channel * channel_multiplier[0]
-        elif scale < 6:  # 128 x 128
-            in_channels += inner_channel * channel_multiplier[1]
-        elif scale < 9:  # 64 x 64
-            in_channels += inner_channel * channel_multiplier[2]
-        elif scale < 12:  # 32 x 32
-            in_channels += inner_channel * channel_multiplier[3]
-        elif scale < 15:  # 16 x 16
-            in_channels += inner_channel * channel_multiplier[4]
-        else:
-            print('Unbounded number for feat_scales. 0<=feat_scales<=14')
-    return in_channels
-
-
-class PhysicsEnhancedBlock(nn.Module):
+class DDPMCDModel(BaseModel):
     """
-    增强的Block，集成物理引导注意力（第一阶段）
+    DDPM-based Change Detection Model
+    支持新的cd_head_v8架构和物理损失
     """
-    def __init__(self, dim, dim_out, time_steps, physics_attention=None):
-        super().__init__()
-        # 原始的时间步拼接和处理
-        self.time_fusion = nn.Sequential(
-            nn.Conv2d(dim * len(time_steps), dim, 1) if len(time_steps) > 1 else nn.Identity(),
-            nn.ReLU() if len(time_steps) > 1 else nn.Identity(),
-        )
+    def __init__(self, opt):
+        super(DDPMCDModel, self).__init__(opt)
         
-        # 物理引导注意力（策略一）
-        self.physics_attention = physics_attention
+        # 基本配置
+        self.opt = opt
+        self.epoch = 0
+        self.global_step = 0
         
-        # 特征处理
-        self.feature_conv = nn.Sequential(
-            nn.Conv2d(dim, dim_out, 3, padding=1),
-            nn.BatchNorm2d(dim_out),
-            nn.ReLU(inplace=True)
-        )
+        # 定义网络
+        self.netCD = self.set_device(networks.define_CD(opt))
+        self.schedule_phase = None
         
-    def forward(self, x, physical_features=None):
-        # 时间步融合
-        x = self.time_fusion(x)
-        
-        # 应用物理引导注意力（如果可用）
-        if self.physics_attention is not None and physical_features is not None:
-            x, _ = self.physics_attention(x, physical_features)
-        
-        # 特征处理
-        x = self.feature_conv(x)
-        return x
-
-
-class AttentionBlock(nn.Module):
-    """保持原有的AttentionBlock结构"""
-    def __init__(self, dim, dim_out):
-        super().__init__()
-        self.block = nn.Sequential(
-            nn.Conv2d(dim, dim_out, 3, padding=1),
-            nn.ReLU(),
-            ChannelSpatialSELayer(num_channels=dim_out, reduction_ratio=2)
-        )
-
-    def forward(self, x):
-        return self.block(x)
-
-
-class cd_head_v8(nn.Module):
-    '''
-    Change detection head (version 8) - 五阶段智能推理
-    第一阶段：物理引导的状态理解 ✓
-    第二阶段：智能的交互式对比（交叉注意力）✓
-    第三阶段：全局形态学分析（Mamba）✓
-    第四阶段：物理引导的变化聚焦 - TODO
-    第五阶段：条件化专家决策（MoE）- TODO
-    '''
-
-    def __init__(self, feat_scales, out_channels=2, inner_channel=None, 
-                 channel_multiplier=None, img_size=256, time_steps=None,
-                 physics_config=None, cross_attention_config=None, 
-                 mamba_config=None):
-        super(cd_head_v8, self).__init__()
-
-        # 基础参数设置
-        feat_scales.sort(reverse=True)
-        self.feat_scales = feat_scales
-        self.img_size = img_size
-        self.time_steps = time_steps if time_steps is not None else [0]
-        
-        # 物理配置
-        self.physics_config = physics_config or {}
-        self.use_physics = self.physics_config.get('enabled', False)
-        
-        # 交叉注意力配置
-        self.cross_attention_config = cross_attention_config or {}
-        self.use_cross_attention = self.cross_attention_config.get('enabled', True)
-        
-        # Mamba配置
-        self.mamba_config = mamba_config or {}
-        self.use_mamba = self.mamba_config.get('enabled', True)
-        
-        # 物理特征编码器
-        if self.use_physics:
-            self.physical_encoder = PhysicalFeatureEncoder(
-                input_channels=self.physics_config.get('num_physical_layers', 2),
-                output_channels=self.physics_config.get('physical_embedding_dim', 64)
-            )
-        
-        # 计算每个尺度的维度
-        self.scale_dims = []
-        for scale in self.feat_scales:
-            dim = get_in_channels([scale], inner_channel, channel_multiplier)
-            self.scale_dims.append(dim)
-        
-        # 多尺度交叉注意力模块（第二阶段）
-        if self.use_cross_attention:
-            self.cross_attention = MultiScaleCrossAttention(
-                scale_dims=self.scale_dims,
-                num_heads_list=self.cross_attention_config.get('num_heads_list', None),
-                dropout=self.cross_attention_config.get('dropout', 0.1)
-            )
-        
-        # Mamba全局形态分析模块（第三阶段）
-        if self.use_mamba:
-            self.mamba_mixer = ChangeDetectionMamba(
-                scale_dims=self.scale_dims,
-                d_state=self.mamba_config.get('d_state', 16),
-                d_conv=self.mamba_config.get('d_conv', 4),
-                expand=self.mamba_config.get('expand', 2),
-                n_layers=self.mamba_config.get('n_layers', 2),
-                use_multi_direction=self.mamba_config.get('use_multi_direction', True)
-            )
-        
-        # 构建解码器
-        self.decoder = nn.ModuleList()
-        current_decoder_output_channels = 0
-        
-        for i in range(len(self.feat_scales)):
-            dim = self.scale_dims[i]
+        # 设置训练相关
+        if self.opt['phase'] == 'train':
+            self.netCD.train()
             
-            # 为每个尺度创建物理引导注意力模块（第一阶段）
-            physics_attention = None
-            if self.use_physics:
-                physics_attention = PhysicsGuidedAttention(
-                    visual_channels=dim,
-                    physical_channels=self.physics_config.get('physical_embedding_dim', 64),
-                    hidden_dim=self.physics_config.get('physical_embedding_dim', 64),
-                    dropout=self.physics_config.get('dropout', 0.1)
-                )
+            # 定义损失函数
+            self.set_loss()
             
-            # 使用增强的Block
-            self.decoder.append(
-                PhysicsEnhancedBlock(
-                    dim=dim, 
-                    dim_out=dim, 
-                    time_steps=self.time_steps,
-                    physics_attention=physics_attention
+            # 定义优化器
+            train_opt = opt['train']
+            self.optimizer_type = train_opt['optimizer']['type']
+            if self.optimizer_type == 'adam':
+                self.optCD = torch.optim.Adam(
+                    self.netCD.parameters(), 
+                    lr=train_opt['optimizer']['lr'],
+                    betas=(0.9, 0.999)
                 )
-            )
-            current_block_output_channels = dim
-
-            if i != len(self.feat_scales) - 1:
-                dim_out_for_attention = get_in_channels(
-                    [self.feat_scales[i + 1]], inner_channel, channel_multiplier
+            elif self.optimizer_type == 'adamw':
+                self.optCD = torch.optim.AdamW(
+                    self.netCD.parameters(),
+                    lr=train_opt['optimizer']['lr'],
+                    betas=(0.9, 0.999),
+                    weight_decay=train_opt['optimizer'].get('weight_decay', 0.01)
                 )
-                self.decoder.append(
-                    AttentionBlock(dim=current_block_output_channels, dim_out=dim_out_for_attention)
-                )
-                current_decoder_output_channels = dim_out_for_attention
             else:
-                current_decoder_output_channels = current_block_output_channels
+                raise NotImplementedError(f'Optimizer [{self.optimizer_type}] not implemented')
+            
+            # 定义学习率调度器
+            self.scheduler = get_scheduler(self.optCD, train_opt)
+            
+            # 初始化日志
+            self.log_dict = OrderedDict()
+            
+            # 初始化性能指标
+            self.running_metric = ConfuseMatrixMeter(n_class=opt['model_cd']['out_channels'])
+            
+            # TensorBoard logger
+            if 'tb_logger' in opt['path']:
+                from tensorboardX import SummaryWriter
+                self.tb_logger = SummaryWriter(log_dir=opt['path']['tb_logger'])
+        
+        # 加载预训练权重
+        self.load_network()
+        self.print_network()
+        
+        # 记录数据加载器长度
+        self.len_train_dataloader = opt.get('len_train_dataloader', 1)
+        self.len_val_dataloader = opt.get('len_val_dataloader', 1)
 
-        # 最终分类头
-        clfr_emb_dim = 64
-        self.clfr_stg1 = nn.Conv2d(current_decoder_output_channels, clfr_emb_dim, kernel_size=3, padding=1)
-        self.clfr_stg2 = nn.Conv2d(clfr_emb_dim, out_channels, kernel_size=3, padding=1)
-        self.relu = nn.ReLU()
+    def feed_data(self, data):
+        """Feed data to the model"""
+        self.data = self.set_device(data)
+        
+        # 提取必要的数据
+        self.A = self.data['A']
+        self.B = self.data['B']
+        self.label = self.data['L']
+        
+        # 物理数据（如果有）
+        self.physical_data = self.data.get('physical_data', None)
 
-    def forward(self, feats_A, feats_B, physical_data=None):
+    def optimize_parameters(self, features_A=None, features_B=None, current_epoch=None):
         """
-        五阶段智能推理流程
-        
-        Args:
-            feats_A, feats_B: List[List[Tensor]] - DDPM特征
-            physical_data: [B, num_layers, H, W] - 物理数据（DEM, slope等）
+        优化参数
+        支持两种调用方式：
+        1. 传入features_A和features_B（新接口）
+        2. 使用临时保存的特征（兼容接口）
         """
-        # 编码物理特征（如果可用）
-        encoded_physics = None
-        if self.use_physics and physical_data is not None:
-            encoded_physics = self.physical_encoder(physical_data)
+        # 获取特征
+        if features_A is None and hasattr(self, '_temp_features_A'):
+            features_A = self._temp_features_A
+            features_B = self._temp_features_B
+            # 清理临时特征
+            del self._temp_features_A
+            del self._temp_features_B
         
-        # 解码过程
-        lvl_idx = 0
-        x = None
+        # 前向传播
+        if self.opt['model_cd'].get('version') == 'v8':
+            # cd_head_v8直接调用
+            self.change_prediction = self.netCD(features_A, features_B, self.physical_data)
+        else:
+            # 旧版本兼容
+            self.change_prediction = self.netCD(features_A, features_B)
         
-        for layer_idx, layer in enumerate(self.decoder):
-            if isinstance(layer, PhysicsEnhancedBlock):
-                # 收集当前尺度的所有时间步特征
-                if len(self.time_steps) > 1:
-                    list_to_cat_A = [feats_A[t_idx][lvl_idx] for t_idx in range(len(self.time_steps))]
-                    list_to_cat_B = [feats_B[t_idx][lvl_idx] for t_idx in range(len(self.time_steps))]
-                    f_A_cat = torch.cat(list_to_cat_A, dim=1)
-                    f_B_cat = torch.cat(list_to_cat_B, dim=1)
-                else:
-                    f_A_cat = feats_A[0][lvl_idx]
-                    f_B_cat = feats_B[0][lvl_idx]
-                
-                # ========== 第一阶段：独立的状态理解 ==========
-                # 使用物理引导增强特征
-                processed_f_A = layer(f_A_cat, encoded_physics)  # F_A_refined
-                processed_f_B = layer(f_B_cat, encoded_physics)  # F_B_refined
-                
-                # ========== 第二阶段：智能的交互式对比 ==========
-                if self.use_cross_attention:
-                    # 使用交叉注意力进行智能对比
-                    diff = self.cross_attention(processed_f_A, processed_f_B, lvl_idx)
-                    # diff 现在是 diff_preliminary
-                else:
-                    # 回退到简单的差异计算
-                    diff = torch.abs(processed_f_A - processed_f_B)
-                
-                # ========== 第三阶段：全局形态学分析（Mamba）==========
-                if self.use_mamba:
-                    # 使用Mamba捕捉全局空间依赖和形态结构
-                    diff = self.mamba_mixer(diff, lvl_idx)
-                    # diff 现在是 diff_mamba
-                
-                # ========== 第四阶段：物理引导的变化聚焦 ==========
-                # TODO: 在这里添加第二次物理引导注意力（策略二）
-                # diff_focused = self.physics_focus_attention(diff, encoded_physics)
-                
-                # ========== 第五阶段：条件化专家决策（MoE）==========
-                # TODO: 在这里添加 MoE 层
-                # diff = self.moe_layer(diff_focused, condition)
-                
-                # 残差连接
-                if x is not None:
-                    diff = diff + x
-                
-                lvl_idx += 1
-                
-            else:  # AttentionBlock
-                diff = layer(diff)
-                if layer_idx < len(self.decoder) - 1:
-                    x = F.interpolate(diff, scale_factor=2, mode="bilinear", align_corners=False)
-                else:
-                    x = diff
+        # 计算损失
+        self.cal_loss()
+        
+        # 反向传播
+        self.optCD.zero_grad()
+        self.loss_v.backward()
+        
+        # 处理MoE辅助损失（如果存在）
+        if hasattr(self.netCD, 'moe_aux_loss') and self.netCD.training:
+            moe_loss = self.netCD.moe_aux_loss
+            if moe_loss is not None and moe_loss.requires_grad:
+                moe_loss.backward(retain_graph=True)
+                self.log_dict['l_moe'] = moe_loss.item()
+        
+        # 梯度裁剪（可选）
+        if self.opt['train'].get('gradient_clip', 0) > 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.netCD.parameters(), 
+                self.opt['train']['gradient_clip']
+            )
+        
+        # 更新参数
+        self.optCD.step()
+        
+        # 更新全局步数
+        self.global_step += 1
 
-        # 分类
-        cm = self.clfr_stg2(self.relu(self.clfr_stg1(x)))
+    def test(self, features_A=None, features_B=None):
+        """测试/验证阶段"""
+        self.netCD.eval()
         
-        return cm
+        # 获取特征
+        if features_A is None and hasattr(self, '_temp_features_A'):
+            features_A = self._temp_features_A
+            features_B = self._temp_features_B
+            del self._temp_features_A
+            del self._temp_features_B
+        
+        with torch.no_grad():
+            if self.opt['model_cd'].get('version') == 'v8':
+                self.change_prediction = self.netCD(features_A, features_B, self.physical_data)
+            else:
+                self.change_prediction = self.netCD(features_A, features_B)
+            
+            # 计算损失（用于验证）
+            self.cal_loss()
+        
+        self.netCD.train()
+
+    def set_loss(self):
+        """设置损失函数"""
+        loss_type = self.opt['model_cd']['loss_type']
+        
+        if loss_type == 'ce':
+            self.criterion = nn.CrossEntropyLoss()
+        elif loss_type == 'bce':
+            self.criterion = nn.BCEWithLogitsLoss()
+        elif loss_type == 'dice':
+            from misc.losses import DiceLoss
+            self.criterion = DiceLoss()
+        elif loss_type == 'physics_constrained':
+            from misc.losses import PhysicsConstrainedLoss
+            self.criterion = PhysicsConstrainedLoss(
+                base_loss_type=self.opt['model_cd'].get('base_loss', 'ce'),
+                physics_weight=self.opt['model_cd'].get('physics_weight', 0.1)
+            )
+        else:
+            raise NotImplementedError(f'Loss type [{loss_type}] not implemented')
+
+    def cal_loss(self):
+        """计算损失"""
+        # 确保标签格式正确
+        if self.label.dtype != torch.long and self.opt['model_cd']['loss_type'] == 'ce':
+            self.label = self.label.long()
+        
+        if len(self.label.shape) == 4 and self.label.shape[1] == 1:
+            self.label = self.label.squeeze(1)
+        
+        # 计算主损失
+        if self.opt['model_cd']['loss_type'] == 'physics_constrained':
+            # 物理约束损失需要额外信息
+            self.loss_v = self.criterion(
+                self.change_prediction, 
+                self.label,
+                physical_data=self.physical_data,
+                slope_attention=getattr(self.netCD, 'slope_attention', None)
+            )
+        else:
+            self.loss_v = self.criterion(self.change_prediction, self.label)
+        
+        # 记录损失
+        self.log_dict['l_total'] = self.loss_v.item()
+
+    def get_current_visuals(self):
+        """获取当前可视化结果"""
+        out_dict = OrderedDict()
+        
+        # 原始图像
+        out_dict['A'] = self.A.detach().float().cpu()
+        out_dict['B'] = self.B.detach().float().cpu()
+        
+        # 真实标签
+        out_dict['L'] = self.label.detach().float().cpu()
+        
+        # 预测结果
+        if hasattr(self, 'change_prediction'):
+            if self.opt['model_cd']['out_channels'] == 2:
+                # 使用softmax获取变化概率
+                pred_prob = torch.softmax(self.change_prediction, dim=1)
+                out_dict['pred'] = pred_prob[:, 1:2, :, :].detach().float().cpu()
+            else:
+                # 使用sigmoid
+                out_dict['pred'] = torch.sigmoid(self.change_prediction).detach().float().cpu()
+        
+        # 物理数据可视化（如果有）
+        if self.physical_data is not None:
+            out_dict['physics'] = self.physical_data[:, 0:1, :, :].detach().float().cpu()  # 显示第一层（如DEM）
+        
+        return out_dict
+
+    def get_current_losses(self):
+        """获取当前损失"""
+        return self.log_dict
+
+    def print_network(self):
+        """打印网络信息"""
+        s, n = self.get_network_description(self.netCD)
+        if isinstance(self.netCD, nn.DataParallel):
+            net_struc_str = '{} - {}'.format(self.netCD.__class__.__name__,
+                                           self.netCD.module.__class__.__name__)
+        else:
+            net_struc_str = '{}'.format(self.netCD.__class__.__name__)
+        
+        logger.info('Network CD structure: {}, with parameters: {:,d}'.format(net_struc_str, n))
+        logger.info(s)
+
+    def get_network_description(self, network):
+        """获取网络描述"""
+        if isinstance(network, nn.DataParallel):
+            network = network.module
+        s = str(network)
+        n = sum(map(lambda x: x.numel(), network.parameters()))
+        return s, n
+
+    def save_network(self, epoch, iter_step):
+        """保存网络"""
+        gen_path = os.path.join(
+            self.opt['path']['checkpoint'], 'I{}_E{}_gen.pth'.format(iter_step, epoch))
+        opt_path = os.path.join(
+            self.opt['path']['checkpoint'], 'I{}_E{}_opt.pth'.format(iter_step, epoch))
+        
+        # 保存网络
+        network = self.netCD
+        if isinstance(network, nn.DataParallel):
+            network = network.module
+        state_dict = network.state_dict()
+        for key, param in state_dict.items():
+            state_dict[key] = param.cpu()
+        torch.save(state_dict, gen_path)
+        
+        # 保存优化器
+        opt_state = {
+            'epoch': epoch,
+            'iter': iter_step,
+            'scheduler': self.scheduler.state_dict(),
+            'optimizer': self.optCD.state_dict()
+        }
+        torch.save(opt_state, opt_path)
+        
+        logger.info('Saved model in [{:s}] ...'.format(gen_path))
+
+    def load_network(self):
+        """加载网络"""
+        load_path = self.opt['path_cd'].get('resume_state', None)
+        if load_path is not None:
+            logger.info('Loading pretrained model for CD [{:s}] ...'.format(load_path))
+            
+            gen_path = f'{load_path}_gen.pth'
+            opt_path = f'{load_path}_opt.pth'
+            
+            # 加载网络
+            network = self.netCD
+            if isinstance(network, nn.DataParallel):
+                network = network.module
+            
+            network.load_state_dict(torch.load(gen_path), strict=True)
+            
+            # 加载优化器（仅训练时）
+            if self.opt['phase'] == 'train' and os.path.exists(opt_path):
+                opt_state = torch.load(opt_path)
+                self.begin_epoch = opt_state['epoch']
+                self.begin_step = opt_state['iter']
+                self.optCD.load_state_dict(opt_state['optimizer'])
+                self.scheduler.load_state_dict(opt_state['scheduler'])
+
+    def _update_metric(self):
+        """更新评估指标"""
+        if hasattr(self, 'change_prediction') and hasattr(self, 'label'):
+            G_pred = self.change_prediction.detach()
+            G_pred = torch.argmax(G_pred, dim=1)
+            current_score = self.running_metric.update_cm(
+                pr=G_pred.cpu().numpy(), 
+                gt=self.label.detach().cpu().numpy()
+            )
+            return current_score
+        return 0.0
+
+    def _collect_running_batch_states(self):
+        """收集运行时批次状态"""
+        self.running_acc = self._update_metric()
+        
+        m = len(self.log_dict)
+        if m == self.len_train_dataloader:
+            for key in self.log_dict.keys():
+                self.log_dict[key] /= m
+            
+            message = '[Training CD]. epoch: [%d/%d]. Aver_running_acc:%.5f\n' % \
+                    (self.epoch, self.opt['train']['n_epoch']-1, self.running_acc/m)
+            for k, v in self.log_dict.items():
+                message += '%s: %.4e ' % (k, v)
+                if hasattr(self, 'tb_logger'):
+                    self.tb_logger.add_scalar(k, v, self.global_step)
+            
+            logger.info(message)
+            self.log_dict = OrderedDict()
+
+    def _clear_cache(self):
+        """清理缓存"""
+        self.running_metric.clear()
