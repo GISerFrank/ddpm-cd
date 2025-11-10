@@ -85,7 +85,10 @@ class CDDataset(Dataset):
         """
         新逻辑：直接使用 a_path,并从中推断其他路径。
         适配新的目录结构：train/Region/pre_event/png/file.png
-        关键修改：从 a_path 中提取真实的 split（train/test/val），而不是使用 self.split
+
+        关键修复：由于 list 文件中的路径可能与实际文件位置不符
+        （例如 test.txt 里写 test/Region/... 但文件实际在 train/Region/...）
+        因此需要在 train/test/val 三个文件夹中搜索文件
         """
         try:
             path_parts = a_path.split(os.sep)
@@ -98,21 +101,35 @@ class CDDataset(Dataset):
             if event_index == -1:
                  raise ValueError(f"路径中未找到 'pre_event' 或 'post_event' 文件夹: {a_path}")
 
-            # 从路径中提取真实的 split（假设格式为 split/region/pre_event/...）
-            # event_index - 1 是 region，event_index - 2 是 split
-            if event_index >= 2:
-                actual_split = path_parts[event_index - 2]
-            else:
-                # 如果路径格式不符合预期，回退到使用 self.split
-                actual_split = self.split
-                warnings.warn(f"无法从路径中解析 split，使用 self.split={self.split}: {a_path}")
-
-            # 区域名就是 event 文件夹的上一级目录
+            # 提取 region 和 filename
             region_name = path_parts[event_index - 1]
             patch_base_name = path_parts[-1]
             patch_stem = os.path.splitext(patch_base_name)[0]
 
-            # 使用从路径中解析的 actual_split 而不是 self.split
+            # 关键修改：在 train/test/val 三个文件夹中搜索文件
+            actual_split = None
+            for candidate_split in ['train', 'test', 'val']:
+                candidate_path = os.path.join(
+                    self.physical_data_root,
+                    candidate_split,
+                    region_name,
+                    "pre_event",
+                    "png",
+                    patch_base_name
+                )
+                if os.path.exists(candidate_path):
+                    actual_split = candidate_split
+                    break
+
+            # 如果找不到文件，使用 list 文件中指定的 split（即使文件不存在）
+            if actual_split is None:
+                if event_index >= 2:
+                    actual_split = path_parts[event_index - 2]
+                else:
+                    actual_split = self.split
+                warnings.warn(f"无法在 train/test/val 中找到文件 {patch_base_name}，region={region_name}，使用默认 split={actual_split}")
+
+            # 使用找到的 actual_split 构建所有路径
             base_path = os.path.join(self.physical_data_root, actual_split, region_name)
             
             # === 修复：添加 png 子目录 ===
