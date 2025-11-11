@@ -123,13 +123,28 @@ def create_image_dataset(dataset_opt, phase):
 def create_cd_dataset(dataset_opt, phase):
     '''create change detection dataset'''
     # mode = dataset_opt.get('mode', None) # 使用 get 避免 KeyError
-    # 确保这是您修改后的CDDataset.py中定义的类，并且文件名已更改
-    from data.CDDataset_GVLM_CD import CDDataset as D 
-    dataset = D(dataroot=dataset_opt['dataroot'],
-                resolution=dataset_opt['resolution'],
-                split=phase,
-                data_len=dataset_opt.get('data_len', -1) # 使用 get
-                )
+
+    # 检查是否使用物理数据版本
+    if dataset_opt.get('use_physical_data', False):
+        # 使用支持物理数据的版本
+        from data.CDDataset_GVLM_CD_physical import CDDataset as D
+        dataset = D(
+            dataroot=dataset_opt['dataroot'],
+            physical_data_root=dataset_opt.get('physical_data_root', None),  # 可选参数
+            resolution=dataset_opt['resolution'],
+            split=phase,
+            data_len=dataset_opt.get('data_len', -1)
+        )
+    else:
+        # 使用原始版本（向后兼容）
+        from data.CDDataset_GVLM_CD import CDDataset as D
+        dataset = D(
+            dataroot=dataset_opt['dataroot'],
+            resolution=dataset_opt['resolution'],
+            split=phase,
+            data_len=dataset_opt.get('data_len', -1)
+        )
+
     logger = logging.getLogger('base')
     logger.info('Dataset [{:s} - {:s} - {:s}] is created.'.format(dataset.__class__.__name__,
                                                            dataset_opt['name'],

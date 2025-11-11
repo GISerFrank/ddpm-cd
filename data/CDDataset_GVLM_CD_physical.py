@@ -57,14 +57,28 @@ def load_img_name_list(dataset_path):
 
 
 class CDDataset(Dataset):
-    def __init__(self, dataroot, physical_data_root, resolution=256, split='train', data_len=-1):
-        
+    def __init__(self, dataroot, physical_data_root=None, resolution=256, split='train', data_len=-1):
+        """
+        Args:
+            dataroot: list 文件所在的根目录（必需）
+            physical_data_root: 实际数据文件所在的根目录（可选）
+                               如果为 None，则使用 dataroot
+                               如果提供，则会在 train/test/val 文件夹中搜索文件
+            resolution: 图像分辨率
+            split: 'train', 'test', 或 'val'
+            data_len: 数据集长度限制，-1 表示使用全部数据
+        """
         self.res = resolution
         self.split = split
-        self.dataroot = dataroot 
-        self.physical_data_root = physical_data_root
-        if self.physical_data_root:
-            print(f"[{self.split} 数据集] 将从 '{self.physical_data_root}' 加载物理数据。")
+        self.dataroot = dataroot
+
+        # 如果没有指定 physical_data_root，使用 dataroot（向后兼容）
+        self.physical_data_root = physical_data_root if physical_data_root is not None else dataroot
+
+        if physical_data_root is not None and physical_data_root != dataroot:
+            print(f"[{self.split} 数据集] 将从 '{self.physical_data_root}' 加载数据（支持跨 split 搜索）")
+        else:
+            print(f"[{self.split} 数据集] 将从 '{self.dataroot}' 加载数据（传统模式）")
 
         self.list_path = os.path.join(self.dataroot, 'list', self.split + '.txt')
         self.img_name_list = load_img_name_list(self.list_path)
